@@ -1,32 +1,102 @@
-name: Build Linux 5.x Server for Hi3798MV100
+name: Build hi_kernel-mv100-32.bin (Linux 5.x)
 
 on:
   push:
     branches: [ "main", "master" ]
     paths:
-      # ✅ 核心需求：编辑此 yml 文件时自动触发构建
       - '.github/workflows/build-5x-server.yml'
+      - 'src/**'
+      - 'patches/**'
+      - 'configs/**'
+      - 'dts/**'
   pull_request:
     branches: [ "main", "master" ]
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: 'Linux 5.x kernel tag (e.g. v5.10.226)'
+        required: false
+        default: 'v5.10.226'
 
 env:
-  KERNEL_VERSION: "5.10"
   ARCH: arm
   CROSS_COMPILE: arm-linux-gnueabihf-
-  # ✅ 关键修复：显式指定 ARMv7-A / Cortex-A7 架构
   TARGET_CFLAGS: "-march=armv7-a -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard"
-  DTB_NAME: hisilicon/hi3798mv100.dtb
+  KERNEL_TAG: ${{ github.event.inputs.kernel_tag || 'v5.10.226' }}
+  # 你 fork 的 4.4 内核仓库（用于提取 DTS）
+  DTS_SOURCE_REPO: "teasiu/HiSTBLinuxKernel"
+  DTS_SOURCE_BRANCH: "linux-4.4.y"
+  OUTPUT_BIN: "hi_kernel-mv100-32.bin"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      # ============================================================
+      # Step 1: 从 fork 的 4.4 仓库提取 DTS 文件
+      # ============================================================
+      - name: Extract DTS from teasiu/HiSTBLinuxKernel 4.4.y
+        run: |
+          echo ">>> Cloning DTS source from ${DTS_SOURCE_REPO}:${DTS_SOURCE_BRANCH}"
+          git clone --depth 1 --branch ${DTS_SOURCE_BRANCH} \
+            https://github.com/${DTS_SOURCE_REPO}.git /tmp/dts-source
+          
+          # 查找所有 hi3798mv100 相关的 dts/dtsi 文件
+          echo ">>> Found DTS files:"
+          find /tmp/dts-source/arch/arm/boot/dts/ \
+            -name "*hi3798*" -o -name "*hi3798mv100*" -o -name "*hisi*" \
+            | tee /tmp/dts-list.txt
+          
+          mkdir -p dts
+          cp -v $(cat /tmp/dts-list.txt) dts/ 2>/dev/null || true
+          
+          # 如果仓库根目录有额外的 dts overlay 也一并拷贝
+          if [ -d /tmp/dts-source/dts ]; then
+            cp -rv /tmp/dts-source/dts/* dts/
+          fi
+          
+          ls -la dts/
+
+      # ============================================================
+      # Step 2: 下载 Linux 5.x 内核源码
+      # ============================================================
+      - name: Download Linux 5.x Kernel
+        run: |
+          echo ">>> Downloading kernel ${KERNEL_TAG}"
+          git clone --depth 1 --branch ${KERNEL_TAG} \
+            https://github.com/torvalds/linux.git /tmp/kernel-src
+          
+          # 将提取的 DTS 注入 5.x 内核源码树
+          echo ">>> Injecting DTS into 5.x kernel tree"
+          cp -v dts/*.dts dts/*.dtsi \
+            /tmp/kernel-src/arch/arm/boot/dts/ 2>/dev/null || true
+          
+          # 确保 Makefile 中包含我们的 dtb 目标
+          # 自动检测主 dts 文件名
+          MAIN_DTS=$(ls dts/hi3798mv100*.dts 2>/dev/null | head -1 | xargs basename .dts)
+          if [ -z "$MAIN_DTS" ]; then
+            MAIN_DTS=$(ls dts/*hi3798*.dts 2>/dev/null | head -1 | xargs basename .dts)
+          fi
+          echo "MAIN_DTB=${MAIN_DTS}.dtb" >> $GITHUB_ENV
+          echo ">>> Main DTB target: ${MAIN_DTS}.dtb"
+          
+          # 检查 Makefile 是否已包含该 dtb，如果没有则追加
+          if ! grep -q "${MAIN_DTS}.dtb" /tmp/kernel-src/arch/arm/boot/dts/Makefile; then
+            echo ">>> Adding ${MAIN_DTS}.dtb to Makefile"
+            # 找到 hisilicon 相关行或末尾追加
+            sed -i "/^dtb-\$(CONFIG_ARCH_HISI)/a\\	${MAIN_DTS}.dtb" \
+              /tmp/kernel-src/arch/arm/boot/dts/Makefile 2>/dev/null || \
+            echo "	${MAIN_DTS}.dtb" >> /tmp/kernel-src/arch/arm/boot/dts/Makefile
+          fi
+
+      # ============================================================
+      # Step 3: 安装交叉编译工具链和依赖
+      # ============================================================
+      - name: Install Toolchain & Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -34,50 +104,156 @@ jobs:
             g++-arm-linux-gnueabihf \
             binutils-arm-linux-gnueabihf \
             bison flex libssl-dev bc kmod cpio \
-            device-tree-compiler python3 python3-pip \
-            lzop u-boot-tools swig libelf-dev
+            device-tree-compiler python3 lzop \
+            u-boot-tools swig libelf-dev
+
+      # ============================================================
+      # Step 4: 配置内核（纯命令行服务器 + Docker + 网卡）
+      # ============================================================
+      - name: Configure Kernel for Headless Server + Docker
+        working-directory: /tmp/kernel-src
+        run: |
+          # 先用 multi_v7 作为基础
+          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} multi_v7_defconfig
           
-      - name: Verify Toolchain
-        run: |
-          ${CROSS_COMPILE}gcc --version
-          echo "Target CFLAGS: $TARGET_CFLAGS"
+          # 禁用不需要的组件（VDEC/GPU/HDMI/音频）
+          ./scripts/config --disable DRM
+          ./scripts/config --disable DRM_MALI
+          ./scripts/config --disable DRM_LIMA
+          ./scripts/config --disable DRM_PANFROST
+          ./scripts/config --disable FB
+          ./scripts/config --disable FRAMEBUFFER_CONSOLE
+          ./scripts/config --disable LOGO
+          ./scripts/config --disable SOUND
+          ./scripts/config --disable SND_SOC
+          ./scripts/config --disable MEDIA_SUPPORT
+          ./scripts/config --disable VIDEO_DEV
+          ./scripts/config --disable V4L_PLATFORM_DRIVERS
+          ./scripts/config --disable CONFIG_VIDEO_HISI
+          ./scripts/config --disable CONFIG_STAGING_MEDIA
+          
+          # 启用 Docker 必需的内核选项
+          ./scripts/config --enable NAMESPACES
+          ./scripts/config --enable NET_NS
+          ./scripts/config --enable PID_NS
+          ./scripts/config --enable IPC_NS
+          ./scripts/config --enable UTS_NS
+          ./scripts/config --enable CGROUPS
+          ./scripts/config --enable CGROUP_CPUACCT
+          ./scripts/config --enable CGROUP_DEVICE
+          ./scripts/config --enable CGROUP_FREEZER
+          ./scripts/config --enable CGROUP_SCHED
+          ./scripts/config --enable CPUSETS
+          ./scripts/config --enable MEMCG
+          ./scripts/config --enable BLK_CGROUP
+          ./scripts/config --enable CGROUP_PIDS
+          ./scripts/config --enable KEYS
+          ./scripts/config --enable POSIX_MQUEUE
+          ./scripts/config --enable SECCOMP
+          ./scripts/config --enable SECCOMP_FILTER
+          ./scripts/config --enable USER_NS
+          ./scripts/config --enable BRIDGE
+          ./scripts/config --enable BRIDGE_NETFILTER
+          ./scripts/config --enable IP_NF_FILTER
+          ./scripts/config --enable IP_NF_TARGET_MASQUERADE
+          ./scripts/config --enable NETFILTER_XT_MATCH_ADDRTYPE
+          ./scripts/config --enable NETFILTER_XT_MATCH_CONNTRACK
+          ./scripts/config --enable NETFILTER_XT_MATCH_IPVS
+          ./scripts/config --enable IP_VS
+          ./scripts/config --enable IP_VS_NFCT
+          ./scripts/config --enable IP_VS_PROTO_TCP
+          ./scripts/config --enable IP_VS_PROTO_UDP
+          ./scripts/config --enable IP_VS_RR
+          ./scripts/config --enable VXLAN
+          ./scripts/config --enable OVERLAY_FS
+          ./scripts/config --enable EXT4_FS
+          ./scripts/config --enable TMPFS_POSIX_ACL
+          ./scripts/config --enable PROC_PID_CPUSET
+          ./scripts/config --enable BLK_DEV_DM
+          ./scripts/config --enable DM_THIN_PROVISIONING
+          ./scripts/config --enable BTRFS_FS
+          
+          # 确保以太网驱动启用（Hi3798MV100 内置 GMAC）
+          ./scripts/config --enable NET_VENDOR_HISILICON
+          ./scripts/config --enable HNS_MDIO
+          ./scripts/config --enable HNS
+          ./scripts/config --enable STMMAC_ETH
+          ./scripts/config --enable PHYLIB
+          
+          # 启用 IKCONFIG 方便后续调试
+          ./scripts/config --enable IKCONFIG
+          ./scripts/config --enable IKCONFIG_PROC
+          
+          # 应用修改
+          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
+          
+          echo ">>> Final config verification:"
+          grep -E "CONFIG_(NAMESPACES|CGROUPS|BRIDGE|OVERLAY_FS|STMMAC|HNS|DRM|SOUND|MEDIA)" .config | head -30
 
-      - name: Configure Kernel
+      # ============================================================
+      # Step 5: 编译 zImage + DTB
+      # ============================================================
+      - name: Compile Kernel
+        working-directory: /tmp/kernel-src
         run: |
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
             CFLAGS="${TARGET_CFLAGS}" \
-            multi_v7_defconfig
+            zImage ${MAIN_DTB} -j$(nproc) 2>&1 | tail -50
+          
+          echo ">>> Build artifacts:"
+          ls -lh arch/arm/boot/zImage
+          ls -lh arch/arm/boot/dts/${MAIN_DTB}
 
-      - name: Compile zImage
+      # ============================================================
+      # Step 6: 打包为 hi_kernel-mv100-32.bin（海思刷机格式）
+      # ============================================================
+      - name: Pack hi_kernel-mv100-32.bin
+        working-directory: /tmp/kernel-src
         run: |
-          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            CFLAGS="${TARGET_CFLAGS}" \
-            zImage -j$(nproc)
+          ZIMAGE="arch/arm/boot/zImage"
+          DTB="arch/arm/boot/dts/${MAIN_DTB}"
+          OUTPUT="${{ env.OUTPUT_BIN }}"
+          
+          # ----------------------------------------------------------
+          # 海思 hi_kernel 镜像格式说明：
+          # hi_kernel-mv100-32.bin = mkimage 包装的 zImage + appended DTB
+          # Hi3798MV100 的 fastboot 识别 "kernel" 类型的 uImage
+          # 使用 -A arm -O linux -T kernel -C none -a 0x02000000 -e 0x02000000
+          # 地址 0x02000000 是 MV100 默认内核加载地址
+          # ----------------------------------------------------------
+          
+          # 方法：先将 DTB append 到 zImage 尾部，再用 mkimage 打包
+          cat ${ZIMAGE} ${DTB} > /tmp/zImage-dtb
+          
+          mkimage \
+            -A arm \
+            -O linux \
+            -T kernel \
+            -C none \
+            -a 0x02000000 \
+            -e 0x02000000 \
+            -n "Linux-5.x-Hi3798MV100-Server" \
+            -d /tmp/zImage-dtb \
+            ${OUTPUT}
+          
+          echo ">>> Generated ${OUTPUT}:"
+          ls -lh ${OUTPUT}
+          file ${OUTPUT}
+          
+          # 复制到 workspace 以便上传
+          cp ${OUTPUT} ${{ github.workspace }}/
 
-      - name: Compile Device Tree
-        run: |
-          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            CFLAGS="${TARGET_CFLAGS}" \
-            ${DTB_NAME} -j$(nproc)
-
-      - name: Compile Modules
-        run: |
-          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            CFLAGS="${TARGET_CFLAGS}" \
-            modules -j$(nproc)
-
-      - name: Package Artifacts
-        run: |
-          mkdir -p output
-          cp arch/arm/boot/zImage output/
-          cp arch/arm/boot/dts/${DTB_NAME} output/
-          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            INSTALL_MOD_PATH=output/modules modules_install
-          cd output && tar czf ../linux-5x-hi3798mv100.tar.gz .
-
-      - name: Upload Build Artifacts
+      # ============================================================
+      # Step 7: 上传产物
+      # ============================================================
+      - name: Upload hi_kernel-mv100-32.bin
         uses: actions/upload-artifact@v4
         with:
-          name: linux-5x-hi3798mv100
-          path: linux-5x-hi3798mv100.tar.gz
-          retention-days: 7
+          name: hi_kernel-mv100-32
+          path: hi_kernel-mv100-32.bin
+          retention-days: 30
+
+      - name: Print Checksum
+        run: |
+          sha256sum hi_kernel-mv100-32.bin
+          md5sum hi_kernel-mv100-32.bin
