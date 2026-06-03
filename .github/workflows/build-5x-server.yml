@@ -23,7 +23,6 @@ env:
   CROSS_COMPILE: arm-linux-gnueabihf-
   TARGET_CFLAGS: "-march=armv7-a -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard"
   KERNEL_TAG: ${{ github.event.inputs.kernel_tag || 'v5.10.237' }}
-  # ✅ 修复1: 使用 stable 仓库而非 torvalds/linux
   KERNEL_REPO: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
   DTS_SOURCE_REPO: "teasiu/HiSTBLinuxKernel"
   DTS_SOURCE_BRANCH: "linux-4.4.y"
@@ -38,52 +37,75 @@ jobs:
         uses: actions/checkout@v4
 
       # ============================================================
-      # Step 1: 从 fork 的 4.4 仓库提取 DTS 文件
+      # Step 1: 提取 DTS + ✅ 修复注入逻辑
       # ============================================================
-      - name: Extract DTS from teasiu/HiSTBLinuxKernel 4.4.y
+      - name: Extract DTS and Inject into Kernel Tree
         run: |
-          echo ">>> Cloning DTS source from ${DTS_SOURCE_REPO}:${DTS_SOURCE_BRANCH}"
+          echo ">>> Cloning DTS source..."
           git clone --depth 1 --branch ${DTS_SOURCE_BRANCH} \
             https://github.com/${DTS_SOURCE_REPO}.git /tmp/dts-source
-          
+
           mkdir -p dts
           find /tmp/dts-source/arch/arm/boot/dts/ \
-            -name "*hi3798*" -o -name "*hi3798mv100*" -o -name "*hisi*" \
+            \( -name "*hi3798*" -o -name "*hisi*" \) \
             -exec cp -v {} dts/ \;
           
           if [ -d /tmp/dts-source/dts ]; then
             cp -rv /tmp/dts-source/dts/* dts/
           fi
-          ls -la dts/
 
-      # ============================================================
-      # Step 2: ✅ 修复 - 下载 Linux 5.10.x Stable 内核
-      # ============================================================
-      - name: Download Linux Stable Kernel
-        run: |
-          echo ">>> Downloading stable kernel ${KERNEL_TAG}"
-          # ✅ 修复2: 去掉 --depth 1，stable 仓库的 tag 需要完整历史解析
-          # ✅ 修复3: 使用 --single-branch 加速指定分支/tag 的克隆
+          echo ">>> Downloading kernel ${KERNEL_TAG}..."
           git clone --single-branch --branch ${KERNEL_TAG} \
             ${KERNEL_REPO} /tmp/kernel-src
-          
-          echo ">>> Injecting DTS into 5.x kernel tree"
-          cp -v dts/*.dts dts/*.dtsi \
-            /tmp/kernel-src/arch/arm/boot/dts/ 2>/dev/null || true
-          
-          MAIN_DTS=$(ls dts/hi3798mv100*.dts 2>/dev/null | head -1 | xargs basename .dts)
+
+          # 拷贝 DTS 到内核源码树
+          cp -v dts/*.dts dts/*.dtsi /tmp/kernel-src/arch/arm/boot/dts/ 2>/dev/null || true
+
+          # ✅ 修复1: 更健壮的 DTB 名称检测（按优先级匹配）
+          MAIN_DTS=""
+          for pattern in "hi3798mv100" "hi3798mdmo1f" "hi3798cv200" "hi3798"; do
+            MATCH=$(ls dts/${pattern}*.dts 2>/dev/null | head -1)
+            if [ -n "$MATCH" ]; then
+              MAIN_DTS=$(basename "$MATCH" .dts)
+              break
+            fi
+          done
+
           if [ -z "$MAIN_DTS" ]; then
-            MAIN_DTS=$(ls dts/*hi3798*.dts 2>/dev/null | head -1 | xargs basename .dts)
-          fi
-          echo "MAIN_DTB=${MAIN_DTS}.dtb" >> $GITHUB_ENV
-          echo ">>> Main DTB target: ${MAIN_DTS}.dtb"
-          
-          if ! grep -q "${MAIN_DTS}.dtb" /tmp/kernel-src/arch/arm/boot/dts/Makefile; then
-            sed -i "/^dtb-\$(CONFIG_ARCH_HISI)/a\\	${MAIN_DTS}.dtb" \
-              /tmp/kernel-src/arch/arm/boot/dts/Makefile 2>/dev/null || \
-            echo "	${MAIN_DTS}.dtb" >> /tmp/kernel-src/arch/arm/boot/dts/Makefile
+            echo "::error::No matching DTS file found! Available files:"
+            ls -la dts/
+            exit 1
           fi
 
+          echo "MAIN_DTB=${MAIN_DTS}.dtb" >> $GITHUB_ENV
+          echo ">>> Selected DTB: ${MAIN_DTS}.dtb"
+
+          # ✅ 修复2: 使用 printf '\t' 确保插入真正的 Tab 字符
+          MAKEFILE="/tmp/kernel-src/arch/arm/boot/dts/Makefile"
+          DTB_TARGET="${MAIN_DTS}.dtb"
+
+          if ! grep -qF "${DTB_TARGET}" "${MAKEFILE}"; then
+            echo ">>> Injecting ${DTB_TARGET} into Makefile with proper Tab indentation"
+            # 查找 hisilicon 相关的 dtb- 行并在其后追加
+            if grep -q 'dtb-$(CONFIG_ARCH_HISI)' "${MAKEFILE}"; then
+              # 使用 awk 精确插入带 Tab 的行
+              awk -v dtb="${DTB_TARGET}" '
+                /^dtb-\$\(CONFIG_ARCH_HISI\)/ { print; print "\t" dtb; next }
+                { print }
+              ' "${MAKEFILE}" > "${MAKEFILE}.tmp"
+              mv "${MAKEFILE}.tmp" "${MAKEFILE}"
+            else
+              # 如果没有 HISI 配置块，追加到文件末尾（带 Tab）
+              printf '\t%s\n' "${DTB_TARGET}" >> "${MAKEFILE}"
+            fi
+          fi
+
+          echo ">>> Verifying Makefile entry:"
+          grep -n "${DTB_TARGET}" "${MAKEFILE}" || { echo "::error::Injection failed!"; exit 1; }
+
+      # ============================================================
+      # Step 2: 安装工具链
+      # ============================================================
       - name: Install Toolchain & Dependencies
         run: |
           sudo apt-get update
@@ -92,18 +114,21 @@ jobs:
             bison flex libssl-dev bc kmod cpio device-tree-compiler \
             python3 lzop u-boot-tools swig libelf-dev
 
+      # ============================================================
+      # Step 3: 配置内核
+      # ============================================================
       - name: Configure Kernel for Headless Server + Docker
         working-directory: /tmp/kernel-src
         run: |
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} multi_v7_defconfig
-          
+
           # 禁用 VDEC/GPU/HDMI/音频
           ./scripts/config --disable DRM --disable DRM_MALI --disable DRM_LIMA --disable DRM_PANFROST
           ./scripts/config --disable FB --disable FRAMEBUFFER_CONSOLE --disable LOGO
           ./scripts/config --disable SOUND --disable SND_SOC
           ./scripts/config --disable MEDIA_SUPPORT --disable VIDEO_DEV --disable V4L_PLATFORM_DRIVERS
-          
-          # 启用 Docker 必需选项
+
+          # Docker 必需选项
           ./scripts/config --enable NAMESPACES --enable NET_NS --enable PID_NS --enable IPC_NS
           ./scripts/config --enable UTS_NS --enable USER_NS --enable CGROUPS --enable MEMCG
           ./scripts/config --enable CGROUP_CPUACCT --enable CGROUP_DEVICE --enable CGROUP_FREEZER
@@ -116,21 +141,33 @@ jobs:
           ./scripts/config --enable IP_VS_PROTO_UDP --enable IP_VS_RR --enable VXLAN
           ./scripts/config --enable OVERLAY_FS --enable EXT4_FS --enable TMPFS_POSIX_ACL
           ./scripts/config --enable BLK_DEV_DM --enable DM_THIN_PROVISIONING --enable BTRFS_FS
-          
-          # 确保以太网驱动
+
+          # 以太网驱动
           ./scripts/config --enable NET_VENDOR_HISILICON --enable HNS_MDIO --enable HNS
           ./scripts/config --enable STMMAC_ETH --enable PHYLIB
           ./scripts/config --enable IKCONFIG --enable IKCONFIG_PROC
-          
+
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
 
-      - name: Compile Kernel
+      # ============================================================
+      # Step 4: 编译
+      # ============================================================
+      - name: Compile Kernel + DTB
         working-directory: /tmp/kernel-src
         run: |
+          echo ">>> Building zImage + ${MAIN_DTB}"
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            CFLAGS="${TARGET_CFLAGS}" zImage ${MAIN_DTB} -j$(nproc) 2>&1 | tail -50
+            CFLAGS="${TARGET_CFLAGS}" \
+            zImage ${MAIN_DTB} -j$(nproc) 2>&1 | tail -80
+
+          echo ">>> Verifying outputs:"
+          test -f arch/arm/boot/zImage || { echo "::error::zImage not found!"; exit 1; }
+          test -f arch/arm/boot/dts/${MAIN_DTB} || { echo "::error::${MAIN_DTB} not found!"; exit 1; }
           ls -lh arch/arm/boot/zImage arch/arm/boot/dts/${MAIN_DTB}
 
+      # ============================================================
+      # Step 5: 打包为海思刷机格式
+      # ============================================================
       - name: Pack hi_kernel-mv100-32.bin
         working-directory: /tmp/kernel-src
         run: |
