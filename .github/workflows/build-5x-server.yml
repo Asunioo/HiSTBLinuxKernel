@@ -1,96 +1,83 @@
-name: Build Hi3798MV100 5.x Server Kernel
+name: Build Linux 5.x Server for Hi3798MV100
 
 on:
-  workflow_dispatch: # 允许网页手动触发
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      # ✅ 核心需求：编辑此 yml 文件时自动触发构建
+      - '.github/workflows/build-5x-server.yml'
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # 允许手动触发
+
+env:
+  KERNEL_VERSION: "5.10"
+  ARCH: arm
+  CROSS_COMPILE: arm-linux-gnueabihf-
+  # ✅ 关键修复：显式指定 ARMv7-A / Cortex-A7 架构
+  TARGET_CFLAGS: "-march=armv7-a -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard"
+  DTB_NAME: hisilicon/hi3798mv100.dtb
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    
     steps:
-      # 1. 拉取官方 Linux 5.10 稳定版源码
-      - name: Checkout Linux 5.10 Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          repository: torvalds/linux
-          ref: v5.10
-          path: linux-5.10
 
-      # 2. 安装交叉编译工具链和依赖
-      - name: Install dependencies and toolchain
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev lzop
+          sudo apt-get install -y \
+            gcc-arm-linux-gnueabihf \
+            g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf \
+            bison flex libssl-dev bc kmod cpio \
+            device-tree-compiler python3 python3-pip \
+            lzop u-boot-tools swig libelf-dev
+          
+      - name: Verify Toolchain
+        run: |
+          ${CROSS_COMPILE}gcc --version
+          echo "Target CFLAGS: $TARGET_CFLAGS"
 
-      # 3. 配置内核（纯命令行 + Docker + 网卡）
       - name: Configure Kernel
         run: |
-          cd linux-5.10
-          # 使用海思32位ARM的默认配置作为基础
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- multi_v7_defconfig
-          
-          # 开启 Docker 必须的 Cgroups、Namespaces 及常用文件系统
-          # 剔除海思私有及不需要的多媒体驱动
-          ./scripts/config --file .config \
-            -e CGROUPS \
-            -e CGROUP_CPUACCT \
-            -e CGROUP_DEVICE \
-            -e CGROUP_FREEZER \
-            -e CGROUP_SCHED \
-            -e CPUSETS \
-            -e MEMCG \
-            -e NAMESPACES \
-            -e NET_NS \
-            -e PID_NS \
-            -e USER_NS \
-            -e UTS_NS \
-            -e EXT4_FS \
-            -e EXT4_FS_POSIX_ACL \
-            -e EXT4_FS_SECURITY \
-            -e OVERLAY_FS \
-            -e IP_NF_NAT \
-            -e NF_NAT \
-            -d HISI_FB \
-            -d HI_TDE \
-            -d HI_VO \
-            -d HI_VOU \
-            -d HI_VDEC \
-            -d HI_VENC \
-            -d HI_HDMI \
-            -d HI_GFX
-          
-          # 自动补全依赖并确认配置
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
+          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            CFLAGS="${TARGET_CFLAGS}" \
+            multi_v7_defconfig
 
-      # 4. 编译内核与设备树 (DTB)
-      - name: Compile Kernel and DTB
+      - name: Compile zImage
         run: |
-          cd linux-5.10
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage -j$(nproc)
-          # 编译海思相关的所有设备树，解决你没有 dtb 文件的问题
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- hisilicon/hi3798mv100.dtb -j$(nproc)
+          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            CFLAGS="${TARGET_CFLAGS}" \
+            zImage -j$(nproc)
 
-      # 5. 打包成 TTL 可刷写的 hi_kernel-mv100-32.bin
-      - name: Package Kernel
+      - name: Compile Device Tree
         run: |
-          cd linux-5.10
-          # 将 zImage 转换为 U-Boot 识别的 uImage 格式
-          mkimage -A arm -O linux -T kernel -C none \
-            -a 0x00008000 -e 0x00008000 \
-            -n "Hi3798MV100-Server-5.10" \
-            -d arch/arm/boot/zImage uImage
-          
-          # 提取编译好的 dtb 文件
-          cp arch/arm/boot/dts/hisilicon/hi3798mv100.dtb ../hi3798mv100.dtb
-          # 生成最终用于刷机的内核文件
-          cp uImage ../hi_kernel-mv100-32.bin
+          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            CFLAGS="${TARGET_CFLAGS}" \
+            ${DTB_NAME} -j$(nproc)
 
-      # 6. 上传编译产物
-      - name: Upload Artifacts
+      - name: Compile Modules
+        run: |
+          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            CFLAGS="${TARGET_CFLAGS}" \
+            modules -j$(nproc)
+
+      - name: Package Artifacts
+        run: |
+          mkdir -p output
+          cp arch/arm/boot/zImage output/
+          cp arch/arm/boot/dts/${DTB_NAME} output/
+          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            INSTALL_MOD_PATH=output/modules modules_install
+          cd output && tar czf ../linux-5x-hi3798mv100.tar.gz .
+
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: hi3798mv100-5x-server-kernel
-          path: |
-            hi_kernel-mv100-32.bin
-            hi3798mv100.dtb
-            linux-5.10/.config
-          retention-days: 9
+          name: linux-5x-hi3798mv100
+          path: linux-5x-hi3798mv100.tar.gz
+          retention-days: 7
