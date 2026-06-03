@@ -37,9 +37,9 @@ jobs:
         uses: actions/checkout@v4
 
       # ============================================================
-      # Step 1: 提取 DTS + ✅ 修复注入逻辑
+      # ✅ 核心修复：不再修改 Makefile，改用独立编译策略
       # ============================================================
-      - name: Extract DTS and Inject into Kernel Tree
+      - name: Prepare Kernel Source and DTS
         run: |
           echo ">>> Cloning DTS source..."
           git clone --depth 1 --branch ${DTS_SOURCE_BRANCH} \
@@ -58,10 +58,10 @@ jobs:
           git clone --single-branch --branch ${KERNEL_TAG} \
             ${KERNEL_REPO} /tmp/kernel-src
 
-          # 拷贝 DTS 到内核源码树
+          # 拷贝 DTS/DTSI 到内核源码树
           cp -v dts/*.dts dts/*.dtsi /tmp/kernel-src/arch/arm/boot/dts/ 2>/dev/null || true
 
-          # ✅ 修复1: 更健壮的 DTB 名称检测（按优先级匹配）
+          # ✅ 仅检测文件名，绝不修改 Makefile
           MAIN_DTS=""
           for pattern in "hi3798mv100" "hi3798mdmo1f" "hi3798cv200" "hi3798"; do
             MATCH=$(ls dts/${pattern}*.dts 2>/dev/null | head -1)
@@ -72,40 +72,15 @@ jobs:
           done
 
           if [ -z "$MAIN_DTS" ]; then
-            echo "::error::No matching DTS file found! Available files:"
+            echo "::error::No matching DTS file found!"
             ls -la dts/
             exit 1
           fi
 
           echo "MAIN_DTB=${MAIN_DTS}.dtb" >> $GITHUB_ENV
           echo ">>> Selected DTB: ${MAIN_DTS}.dtb"
+          echo ">>> NOTE: Will compile DTB independently, NO Makefile modification needed"
 
-          # ✅ 修复2: 使用 printf '\t' 确保插入真正的 Tab 字符
-          MAKEFILE="/tmp/kernel-src/arch/arm/boot/dts/Makefile"
-          DTB_TARGET="${MAIN_DTS}.dtb"
-
-          if ! grep -qF "${DTB_TARGET}" "${MAKEFILE}"; then
-            echo ">>> Injecting ${DTB_TARGET} into Makefile with proper Tab indentation"
-            # 查找 hisilicon 相关的 dtb- 行并在其后追加
-            if grep -q 'dtb-$(CONFIG_ARCH_HISI)' "${MAKEFILE}"; then
-              # 使用 awk 精确插入带 Tab 的行
-              awk -v dtb="${DTB_TARGET}" '
-                /^dtb-\$\(CONFIG_ARCH_HISI\)/ { print; print "\t" dtb; next }
-                { print }
-              ' "${MAKEFILE}" > "${MAKEFILE}.tmp"
-              mv "${MAKEFILE}.tmp" "${MAKEFILE}"
-            else
-              # 如果没有 HISI 配置块，追加到文件末尾（带 Tab）
-              printf '\t%s\n' "${DTB_TARGET}" >> "${MAKEFILE}"
-            fi
-          fi
-
-          echo ">>> Verifying Makefile entry:"
-          grep -n "${DTB_TARGET}" "${MAKEFILE}" || { echo "::error::Injection failed!"; exit 1; }
-
-      # ============================================================
-      # Step 2: 安装工具链
-      # ============================================================
       - name: Install Toolchain & Dependencies
         run: |
           sudo apt-get update
@@ -114,9 +89,6 @@ jobs:
             bison flex libssl-dev bc kmod cpio device-tree-compiler \
             python3 lzop u-boot-tools swig libelf-dev
 
-      # ============================================================
-      # Step 3: 配置内核
-      # ============================================================
       - name: Configure Kernel for Headless Server + Docker
         working-directory: /tmp/kernel-src
         run: |
@@ -150,24 +122,55 @@ jobs:
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
 
       # ============================================================
-      # Step 4: 编译
+      # ✅ 核心修复：分步编译 zImage 和 DTB，完全绕过 Makefile 注入
       # ============================================================
-      - name: Compile Kernel + DTB
+      - name: Compile zImage
         working-directory: /tmp/kernel-src
         run: |
-          echo ">>> Building zImage + ${MAIN_DTB}"
+          echo ">>> Building zImage only..."
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
             CFLAGS="${TARGET_CFLAGS}" \
-            zImage ${MAIN_DTB} -j$(nproc) 2>&1 | tail -80
+            zImage -j$(nproc) 2>&1 | tail -30
+          
+          test -f arch/arm/boot/zImage || { echo "::error::zImage build failed!"; exit 1; }
+          ls -lh arch/arm/boot/zImage
 
-          echo ">>> Verifying outputs:"
-          test -f arch/arm/boot/zImage || { echo "::error::zImage not found!"; exit 1; }
-          test -f arch/arm/boot/dts/${MAIN_DTB} || { echo "::error::${MAIN_DTB} not found!"; exit 1; }
-          ls -lh arch/arm/boot/zImage arch/arm/boot/dts/${MAIN_DTB}
+      - name: Compile DTB Independently
+        working-directory: /tmp/kernel-src
+        run: |
+          echo ">>> Building ${MAIN_DTB} using direct dtc compilation..."
+          
+          DTS_FILE="arch/arm/boot/dts/${MAIN_DTB%.dtb}.dts"
+          DTB_FILE="arch/arm/boot/dts/${MAIN_DTB}"
+          
+          if [ ! -f "$DTS_FILE" ]; then
+            echo "::error::DTS file not found: $DTS_FILE"
+            ls -la arch/arm/boot/dts/*hi3798* 2>/dev/null || true
+            exit 1
+          fi
 
-      # ============================================================
-      # Step 5: 打包为海思刷机格式
-      # ============================================================
+          # ✅ 使用内核自带的 dtc 直接编译，不依赖 Makefile 中的 dtb- 规则
+          # cpp 预处理 + dtc 编译两步走，等价于 Makefile 中的 %.dtb 规则
+          CPP_FLAGS="-nostdinc -I include -I arch/arm/include -I arch/arm/include/generated -undef -x assembler-with-cpp"
+          
+          # Step 1: C 预处理器展开 #include 和宏
+          ${CROSS_COMPILE}gcc -E ${CPP_FLAGS} \
+            -D__ASSEMBLY__ \
+            -include include/linux/kconfig.h \
+            "$DTS_FILE" -o /tmp/preprocessed.dts
+          
+          # Step 2: dtc 编译为二进制 DTB
+          scripts/dtc/dtc \
+            -O dtb \
+            -b 0 \
+            -i arch/arm/boot/dts/ \
+            -W no-unit_address_vs_reg \
+            -o "$DTB_FILE" \
+            /tmp/preprocessed.dts
+          
+          test -f "$DTB_FILE" || { echo "::error::DTB compilation failed!"; exit 1; }
+          ls -lh "$DTB_FILE"
+
       - name: Pack hi_kernel-mv100-32.bin
         working-directory: /tmp/kernel-src
         run: |
