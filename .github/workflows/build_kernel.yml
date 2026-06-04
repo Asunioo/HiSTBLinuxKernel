@@ -1,4 +1,4 @@
-name: 编译 Hi3798MV100 Linux6.6 LTS 内核
+name: 编译 Hi3798MV100 Linux6.6 LTS 内核（原生驱动版）
 on:
   workflow_dispatch:
 
@@ -13,61 +13,38 @@ jobs:
           ref: v6.6
           fetch-depth: 1
 
-      - name: 拉取你的4.4.y分支并提取板级文件
-        run: |
-          git clone --depth=1 https://github.com/ASDHiope/HiSTBLinuxKernel.git -b linux-4.4.y hisi-drivers
-          
-          # 1. 复制你仓库原生的defconfig（最可靠的基础配置）
-          cp hisi-drivers/arch/arm/configs/hi3798mv100_defconfig arch/arm/configs/
-          
-          # 2. 复制以太网驱动（修正路径：在drivers/net/下）
-          cp hisi-drivers/drivers/net/hi_eth.c drivers/net/
-          cp hisi-drivers/drivers/net/hi_eth.h drivers/net/
-          
-          # 3. 复制MMC存储驱动
-          cp hisi-drivers/drivers/mmc/host/dw_mmc_hi3798.c drivers/mmc/host/
-          
-          # 4. 复制海思平台核心支持文件
-          cp -r hisi-drivers/arch/arm/mach-hisi/ arch/arm/
-          
-          # 5. 更新Makefile和Kconfig
-          echo "obj-$(CONFIG_HI_ETH) += hi_eth.o" >> drivers/net/Makefile
-          echo "config HI_ETH" >> drivers/net/Kconfig
-          echo "  tristate \"Hisilicon HI_ETH Ethernet support\"" >> drivers/net/Kconfig
-          echo "  depends on ARCH_HISI" >> drivers/net/Kconfig
-          
-          echo "obj-$(CONFIG_MMC_DW_HI3798) += dw_mmc_hi3798.o" >> drivers/mmc/host/Makefile
-
       - name: 安装编译依赖
         run: |
           sudo apt update -y
           sudo apt install -y gcc-arm-linux-gnueabihf make bison flex libssl-dev libelf-dev bc u-boot-tools
 
-      - name: 生成内核配置（基于你仓库原生defconfig）
+      - name: 生成纯CLI+Docker专用配置（使用内核原生驱动）
         run: |
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
           
-          # 加载你仓库原生的Hi3798MV100配置
-          make hi3798mv100_defconfig
+          # 基于ARMv7通用配置
+          make multi_v7_defconfig
           
-          # 彻底禁用所有不需要的功能
-          scripts/config --disable CONFIG_HI_VDEC
-          scripts/config --disable CONFIG_HI_GPU
-          scripts/config --disable CONFIG_HI_HDMI
-          scripts/config --disable CONFIG_HI_MEDIA
-          scripts/config --disable CONFIG_FB
-          scripts/config --disable CONFIG_DRM
-          scripts/config --disable CONFIG_VIDEO
-          scripts/config --disable CONFIG_SOUND
-          scripts/config --disable CONFIG_INPUT_KEYBOARD
-          scripts/config --disable CONFIG_INPUT_MOUSE
-          scripts/config --disable CONFIG_USB_SUPPORT
-          scripts/config --disable CONFIG_PCI
-          scripts/config --disable CONFIG_BLUETOOTH
-          scripts/config --disable CONFIG_WIRELESS
+          # 启用Hi3798MV100平台支持
+          scripts/config --enable CONFIG_ARCH_HISI
+          scripts/config --enable CONFIG_ARCH_HI3798
           
-          # 强制启用Docker所有必需依赖
+          # 启用内核原生海思以太网驱动（不需要复制任何文件）
+          scripts/config --enable CONFIG_HISI_FEMAC
+          scripts/config --enable CONFIG_PHYLIB
+          scripts/config --enable CONFIG_REALTEK_PHY
+          
+          # 启用MMC存储驱动
+          scripts/config --enable CONFIG_MMC
+          scripts/config --enable CONFIG_MMC_DW
+          scripts/config --enable CONFIG_MMC_DW_HISI
+          
+          # 启用串口控制台
+          scripts/config --enable CONFIG_SERIAL_AMBA_PL011
+          scripts/config --enable CONFIG_SERIAL_AMBA_PL011_CONSOLE
+          
+          # 启用Docker所有必需依赖
           scripts/config --enable CONFIG_CGROUPS
           scripts/config --enable CONFIG_CGROUP_FREEZER
           scripts/config --enable CONFIG_CGROUP_PIDS
@@ -81,14 +58,29 @@ jobs:
           scripts/config --enable CONFIG_CAPABILITIES
           scripts/config --enable CONFIG_BPF_SYSCALL
           scripts/config --enable CONFIG_NETFILTER
+          scripts/config --enable CONFIG_IP_NF_FILTER
+          scripts/config --enable CONFIG_IP_NF_NAT
           
-          # 启用模块支持和内核优化
+          # 启用模块支持
           scripts/config --enable CONFIG_MODULES
           scripts/config --enable CONFIG_MODULE_UNLOAD
+          scripts/config --enable CONFIG_MODVERSIONS
+          
+          # 彻底禁用所有不需要的功能
+          scripts/config --disable CONFIG_DRM
+          scripts/config --disable CONFIG_FB
+          scripts/config --disable CONFIG_VIDEO
+          scripts/config --disable CONFIG_SOUND
+          scripts/config --disable CONFIG_INPUT_KEYBOARD
+          scripts/config --disable CONFIG_INPUT_MOUSE
+          scripts/config --disable CONFIG_USB_SUPPORT
+          scripts/config --disable CONFIG_PCI
+          scripts/config --disable CONFIG_BLUETOOTH
+          scripts/config --disable CONFIG_WIRELESS
           scripts/config --disable CONFIG_DEBUG_INFO
           scripts/config --enable CONFIG_KERNEL_ZSTD
           
-          # 自动补全所有6.x内核新增的配置项（无交互式）
+          # 自动补全所有配置
           make olddefconfig
 
       - name: 编译6.6内核
@@ -99,10 +91,9 @@ jobs:
 
       - name: 生成刷机专用hi_kernel-mv100-32.bin
         run: |
-          # 使用系统自带mkimage（功能与海思原版完全一致）
           mkimage -A arm -O linux -T kernel -C none \
             -a 0x40008000 -e 0x40008000 \
-            -n "Linux6.6-MV100-PureCLI" \
+            -n "Linux6.6-MV100-Native" \
             -d arch/arm/boot/zImage hi_kernel-mv100-32.bin
           
           echo "编译完成！内核文件信息："
@@ -111,6 +102,6 @@ jobs:
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: hi_kernel-mv100-32-6.6-final
+          name: hi_kernel-mv100-32-6.6-native
           path: hi_kernel-mv100-32.bin
           retention-days: 180
