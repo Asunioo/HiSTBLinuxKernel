@@ -1,6 +1,6 @@
 name: 编译 Hi3798MV100 Linux6.6 内核
 on:
-  workflow_dispatch:  # 手动触发编译（点一下就跑）
+  workflow_dispatch:
 
 jobs:
   build:
@@ -11,20 +11,17 @@ jobs:
         with:
           ref: linux-6.x
 
-      - name: 安装编译工具（官方源，无404错误）
+      - name: 安装编译工具
         run: |
           sudo apt update -y
           sudo apt install -y gcc-arm-linux-gnueabihf make bison flex libssl-dev libelf-dev bc u-boot-tools
 
-      - name: 生成 6.x 内核配置（纯命令行+无显示+Docker）
+      - name: 生成 6.x 内核配置
         run: |
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
-          
-      # 清理旧配置
           make mrproper
           
-      # 创建最小化纯CLI配置
           cat > .config << EOF
           CONFIG_SYSVIPC=y
           CONFIG_POSIX_MQUEUE=y
@@ -56,6 +53,7 @@ jobs:
           CONFIG_OVERLAY_FS=y
           CONFIG_SECCOMP=y
           CONFIG_KERNEL_ZSTD=y
+          # 关闭所有显示/多媒体
           CONFIG_VIRTUALIZATION=n
           CONFIG_DRM=n
           CONFIG_FB=n
@@ -68,13 +66,13 @@ jobs:
           CONFIG_HI_HDMI=n
           EOF
 
-      - name: 编译 6.6 内核 zImage
+      - name: 编译内核 zImage
         run: |
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
           make -j2 zImage
 
-      - name: 生成刷机专用 hi_kernel-mv100-32.bin
+      - name: 生成刷机专用内核 bin
         run: |
           mkimage -A arm -O linux -T kernel -C none -a 0x40008000 -e 0x40008000 -n "Linux6.6-MV100" -d arch/arm/boot/zImage hi_kernel-mv100-32.bin
           ls -lh hi_kernel-mv100-32.bin
