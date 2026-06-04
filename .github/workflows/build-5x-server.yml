@@ -1,196 +1,74 @@
-name: Build hi_kernel-mv100-32.bin (Linux 5.x)
-
+name: Build Hi3798MV100 Linux5.x Kernel bin
 on:
   push:
-    branches: [ "main", "master" ]
-    paths:
-      - '.github/workflows/build-5x-server.yml'
-      - 'src/**'
-      - 'patches/**'
-      - 'configs/**'
-      - 'dts/**'
-  pull_request:
-    branches: [ "main", "master" ]
+    branches: [ main, linux-5.x ]
   workflow_dispatch:
-    inputs:
-      kernel_tag:
-        description: 'Stable kernel tag (e.g. v5.10.237)'
-        required: false
-        default: 'v5.10.237'
-
-env:
-  ARCH: arm
-  CROSS_COMPILE: arm-linux-gnueabihf-
-  TARGET_CFLAGS: "-march=armv7-a -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard"
-  KERNEL_TAG: ${{ github.event.inputs.kernel_tag || 'v5.10.237' }}
-  KERNEL_REPO: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
-  DTS_SOURCE_REPO: "teasiu/HiSTBLinuxKernel"
-  DTS_SOURCE_BRANCH: "linux-4.4.y"
-  OUTPUT_BIN: "hi_kernel-mv100-32.bin"
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-
+  build-kernel:
+    runs-on: ubuntu-20.04
+    env:
+      ARCH: arm
+      CROSS_COMPILE: arm-linux-gnueabihf-
     steps:
-      - name: Checkout current repo
+      - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          repository: ASDHiope/HiSTBLinuxKernel
+          fetch-depth: 0
 
-      # ============================================================
-      # ✅ 核心修复：不再修改 Makefile，改用独立编译策略
-      # ============================================================
-      - name: Prepare Kernel Source and DTS
+      - name: Install build deps + Linaro cross toolchain
         run: |
-          echo ">>> Cloning DTS source..."
-          git clone --depth 1 --branch ${DTS_SOURCE_BRANCH} \
-            https://github.com/${DTS_SOURCE_REPO}.git /tmp/dts-source
+          sudo apt update -y
+          sudo apt install -y build-essential gcc g++ make libncurses-dev bison flex libssl-dev libelf-dev bc git wget unzip lz4 cpio device-tree-compiler
+          wget https://releases.linaro.org/components/toolchain/binaries/latest-7/arm-linux-gnueabihf/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf.tar.xz
+          tar -xf gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf.tar.xz -C /opt/
+          echo "/opt/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin" >> $GITHUB_PATH
 
-          mkdir -p dts
-          find /tmp/dts-source/arch/arm/boot/dts/ \
-            \( -name "*hi3798*" -o -name "*hisi*" \) \
-            -exec cp -v {} dts/ \;
-          
-          if [ -d /tmp/dts-source/dts ]; then
-            cp -rv /tmp/dts-source/dts/* dts/
-          fi
-
-          echo ">>> Downloading kernel ${KERNEL_TAG}..."
-          git clone --single-branch --branch ${KERNEL_TAG} \
-            ${KERNEL_REPO} /tmp/kernel-src
-
-          # 拷贝 DTS/DTSI 到内核源码树
-          cp -v dts/*.dts dts/*.dtsi /tmp/kernel-src/arch/arm/boot/dts/ 2>/dev/null || true
-
-          # ✅ 仅检测文件名，绝不修改 Makefile
-          MAIN_DTS=""
-          for pattern in "hi3798mv100" "hi3798mdmo1f" "hi3798cv200" "hi3798"; do
-            MATCH=$(ls dts/${pattern}*.dts 2>/dev/null | head -1)
-            if [ -n "$MATCH" ]; then
-              MAIN_DTS=$(basename "$MATCH" .dts)
-              break
-            fi
-          done
-
-          if [ -z "$MAIN_DTS" ]; then
-            echo "::error::No matching DTS file found!"
-            ls -la dts/
-            exit 1
-          fi
-
-          echo "MAIN_DTB=${MAIN_DTS}.dtb" >> $GITHUB_ENV
-          echo ">>> Selected DTB: ${MAIN_DTS}.dtb"
-          echo ">>> NOTE: Will compile DTB independently, NO Makefile modification needed"
-
-      - name: Install Toolchain & Dependencies
+      - name: Switch linux-5.x branch
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
-            bison flex libssl-dev bc kmod cpio device-tree-compiler \
-            python3 lzop u-boot-tools swig libelf-dev
+          git checkout linux-5.x
 
-      - name: Configure Kernel for Headless Server + Docker
-        working-directory: /tmp/kernel-src
+      - name: Custom defconfig (Disable GPU/VDEC/HDMI, enable eth+docker)
         run: |
-          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} multi_v7_defconfig
+          make hi3798mv100_defconfig
+          # 关闭显示多媒体
+          scripts/config --disable CONFIG_HI_VDEC
+          scripts/config --disable CONFIG_HI_GPU
+          scripts/config --disable CONFIG_HI_HDMI
+          scripts/config --disable CONFIG_FB
+          scripts/config --disable CONFIG_DRM
+          scripts/config --disable CONFIG_VIDEO_HI
+          # 开启以太网
+          scripts/config --enable CONFIG_NET
+          scripts/config --enable CONFIG_ETHERNET
+          scripts/config --enable CONFIG_HI_ETH
+          scripts/config --enable CONFIG_PHYLIB
+          # Docker内核必备
+          scripts/config --enable CONFIG_CGROUPS
+          scripts/config --enable CONFIG_CGROUP_FREEZER
+          scripts/config --enable CONFIG_CGROUP_PIDS
+          scripts/config --enable CONFIG_CGROUP_DEVICE
+          scripts/config --enable CONFIG_NAMESPACES
+          scripts/config --enable CONFIG_OVERLAY_FS
+          scripts/config --enable CONFIG_POSIX_MQUEUE
+          scripts/config --enable CONFIG_SECCOMP
+          scripts/config --enable CONFIG_CAPABILITIES
+          scripts/config --enable CONFIG_MODULES
+          scripts/config --enable CONFIG_MODULE_UNLOAD
+          # CI静默填充配置，杜绝交互
+          make olddefconfig
+          make savedefconfig
+          cp defconfig arch/arm/configs/hi3798mv100_nodisp_docker_defconfig
 
-          # 禁用 VDEC/GPU/HDMI/音频
-          ./scripts/config --disable DRM --disable DRM_MALI --disable DRM_LIMA --disable DRM_PANFROST
-          ./scripts/config --disable FB --disable FRAMEBUFFER_CONSOLE --disable LOGO
-          ./scripts/config --disable SOUND --disable SND_SOC
-          ./scripts/config --disable MEDIA_SUPPORT --disable VIDEO_DEV --disable V4L_PLATFORM_DRIVERS
-
-          # Docker 必需选项
-          ./scripts/config --enable NAMESPACES --enable NET_NS --enable PID_NS --enable IPC_NS
-          ./scripts/config --enable UTS_NS --enable USER_NS --enable CGROUPS --enable MEMCG
-          ./scripts/config --enable CGROUP_CPUACCT --enable CGROUP_DEVICE --enable CGROUP_FREEZER
-          ./scripts/config --enable CGROUP_SCHED --enable CPUSETS --enable BLK_CGROUP --enable CGROUP_PIDS
-          ./scripts/config --enable KEYS --enable POSIX_MQUEUE --enable SECCOMP --enable SECCOMP_FILTER
-          ./scripts/config --enable BRIDGE --enable BRIDGE_NETFILTER --enable IP_NF_FILTER
-          ./scripts/config --enable IP_NF_TARGET_MASQUERADE --enable NETFILTER_XT_MATCH_ADDRTYPE
-          ./scripts/config --enable NETFILTER_XT_MATCH_CONNTRACK --enable NETFILTER_XT_MATCH_IPVS
-          ./scripts/config --enable IP_VS --enable IP_VS_NFCT --enable IP_VS_PROTO_TCP
-          ./scripts/config --enable IP_VS_PROTO_UDP --enable IP_VS_RR --enable VXLAN
-          ./scripts/config --enable OVERLAY_FS --enable EXT4_FS --enable TMPFS_POSIX_ACL
-          ./scripts/config --enable BLK_DEV_DM --enable DM_THIN_PROVISIONING --enable BTRFS_FS
-
-          # 以太网驱动
-          ./scripts/config --enable NET_VENDOR_HISILICON --enable HNS_MDIO --enable HNS
-          ./scripts/config --enable STMMAC_ETH --enable PHYLIB
-          ./scripts/config --enable IKCONFIG --enable IKCONFIG_PROC
-
-          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
-
-      # ============================================================
-      # ✅ 核心修复：分步编译 zImage 和 DTB，完全绕过 Makefile 注入
-      # ============================================================
-      - name: Compile zImage
-        working-directory: /tmp/kernel-src
+      - name: Build zImage + package hi_kernel-mv100-32.bin
         run: |
-          echo ">>> Building zImage only..."
-          make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            CFLAGS="${TARGET_CFLAGS}" \
-            zImage -j$(nproc) 2>&1 | tail -30
-          
-          test -f arch/arm/boot/zImage || { echo "::error::zImage build failed!"; exit 1; }
-          ls -lh arch/arm/boot/zImage
-
-      - name: Compile DTB Independently
-        working-directory: /tmp/kernel-src
-        run: |
-          echo ">>> Building ${MAIN_DTB} using direct dtc compilation..."
-          
-          DTS_FILE="arch/arm/boot/dts/${MAIN_DTB%.dtb}.dts"
-          DTB_FILE="arch/arm/boot/dts/${MAIN_DTB}"
-          
-          if [ ! -f "$DTS_FILE" ]; then
-            echo "::error::DTS file not found: $DTS_FILE"
-            ls -la arch/arm/boot/dts/*hi3798* 2>/dev/null || true
-            exit 1
-          fi
-
-          # ✅ 使用内核自带的 dtc 直接编译，不依赖 Makefile 中的 dtb- 规则
-          # cpp 预处理 + dtc 编译两步走，等价于 Makefile 中的 %.dtb 规则
-          CPP_FLAGS="-nostdinc -I include -I arch/arm/include -I arch/arm/include/generated -undef -x assembler-with-cpp"
-          
-          # Step 1: C 预处理器展开 #include 和宏
-          ${CROSS_COMPILE}gcc -E ${CPP_FLAGS} \
-            -D__ASSEMBLY__ \
-            -include include/linux/kconfig.h \
-            "$DTS_FILE" -o /tmp/preprocessed.dts
-          
-          # Step 2: dtc 编译为二进制 DTB
-          scripts/dtc/dtc \
-            -O dtb \
-            -b 0 \
-            -i arch/arm/boot/dts/ \
-            -W no-unit_address_vs_reg \
-            -o "$DTB_FILE" \
-            /tmp/preprocessed.dts
-          
-          test -f "$DTB_FILE" || { echo "::error::DTB compilation failed!"; exit 1; }
-          ls -lh "$DTB_FILE"
-
-      - name: Pack hi_kernel-mv100-32.bin
-        working-directory: /tmp/kernel-src
-        run: |
-          cat arch/arm/boot/zImage arch/arm/boot/dts/${MAIN_DTB} > /tmp/zImage-dtb
-          mkimage -A arm -O linux -T kernel -C none \
-            -a 0x02000000 -e 0x02000000 \
-            -n "Linux-5.x-Hi3798MV100-Server" \
-            -d /tmp/zImage-dtb ${{ env.OUTPUT_BIN }}
-          ls -lh ${{ env.OUTPUT_BIN }}
-          file ${{ env.OUTPUT_BIN }}
-          cp ${{ env.OUTPUT_BIN }} ${{ github.workspace }}/
+          make -j$(nproc) zImage
+          [ ! -f mkimage ] && wget https://github.com/ASDHiope/HiSTBLinuxKernel/raw/linux-4.4.y/tools/mkimage && chmod +x mkimage
+          ./mkimage -A arm -O linux -T kernel -C none -a 0x40008000 -e 0x40008000 -n Linux5.x-MV100 -d arch/arm/boot/zImage hi_kernel-mv100-32.bin
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hi_kernel-mv100-32
+          name: hi_kernel-mv100-32-bin
           path: hi_kernel-mv100-32.bin
-          retention-days: 30
-
-      - name: Print Checksum
-        run: |
-          sha256sum hi_kernel-mv100-32.bin
-          md5sum hi_kernel-mv100-32.bin
