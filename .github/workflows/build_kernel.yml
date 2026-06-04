@@ -13,73 +13,51 @@ jobs:
           ref: v6.6
           fetch-depth: 1
 
-      - name: 拉取你的4.4.y分支中的Hi3798MV100板级驱动
+      - name: 拉取你的4.4.y分支并提取板级文件
         run: |
           git clone --depth=1 https://github.com/ASDHiope/HiSTBLinuxKernel.git -b linux-4.4.y hisi-drivers
           
-          # 复制以太网驱动
-          cp -r hisi-drivers/drivers/net/ethernet/hisilicon/hi_eth.c drivers/net/ethernet/hisilicon/
-          cp -r hisi-drivers/drivers/net/ethernet/hisilicon/hi_eth.h drivers/net/ethernet/hisilicon/
+          # 1. 复制你仓库原生的defconfig（最可靠的基础配置）
+          cp hisi-drivers/arch/arm/configs/hi3798mv100_defconfig arch/arm/configs/
           
-          # 复制MMC驱动
-          cp -r hisi-drivers/drivers/mmc/host/dw_mmc_hi3798.c drivers/mmc/host/
+          # 2. 复制以太网驱动（修正路径：在drivers/net/下）
+          cp hisi-drivers/drivers/net/hi_eth.c drivers/net/
+          cp hisi-drivers/drivers/net/hi_eth.h drivers/net/
           
-          # 复制板级支持文件
+          # 3. 复制MMC存储驱动
+          cp hisi-drivers/drivers/mmc/host/dw_mmc_hi3798.c drivers/mmc/host/
+          
+          # 4. 复制海思平台核心支持文件
           cp -r hisi-drivers/arch/arm/mach-hisi/ arch/arm/
           
-          # 添加Kconfig和Makefile支持
-          echo "obj-y += hi_eth.o" >> drivers/net/ethernet/hisilicon/Makefile
-          echo "config HI_ETH" >> drivers/net/ethernet/hisilicon/Kconfig
-          echo "  tristate \"Hisilicon HI_ETH support\"" >> drivers/net/ethernet/hisilicon/Kconfig
-          echo "  depends on ARCH_HISI" >> drivers/net/ethernet/hisilicon/Kconfig
+          # 5. 更新Makefile和Kconfig
+          echo "obj-$(CONFIG_HI_ETH) += hi_eth.o" >> drivers/net/Makefile
+          echo "config HI_ETH" >> drivers/net/Kconfig
+          echo "  tristate \"Hisilicon HI_ETH Ethernet support\"" >> drivers/net/Kconfig
+          echo "  depends on ARCH_HISI" >> drivers/net/Kconfig
           
-          echo "obj-y += dw_mmc_hi3798.o" >> drivers/mmc/host/Makefile
+          echo "obj-$(CONFIG_MMC_DW_HI3798) += dw_mmc_hi3798.o" >> drivers/mmc/host/Makefile
 
       - name: 安装编译依赖
         run: |
           sudo apt update -y
           sudo apt install -y gcc-arm-linux-gnueabihf make bison flex libssl-dev libelf-dev bc u-boot-tools
 
-      - name: 生成完整内核配置（无交互式问题）
+      - name: 生成内核配置（基于你仓库原生defconfig）
         run: |
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
           
-          # 基于multi_v7_defconfig生成基础配置（ARMv7通用）
-          make multi_v7_defconfig
-          
-          # 启用Hi3798MV100专用驱动
-          scripts/config --enable CONFIG_ARCH_HISI
-          scripts/config --enable CONFIG_ARCH_HI3798MV100
-          scripts/config --enable CONFIG_HI_ETH
-          scripts/config --enable CONFIG_MMC_DW_HI3798
-          scripts/config --enable CONFIG_SERIAL_AMBA_PL011
-          scripts/config --enable CONFIG_SERIAL_AMBA_PL011_CONSOLE
-          
-          # 启用以太网和PHY
-          scripts/config --enable CONFIG_NET
-          scripts/config --enable CONFIG_ETHERNET
-          scripts/config --enable CONFIG_PHYLIB
-          scripts/config --enable CONFIG_REALTEK_PHY
-          
-          # 启用Docker所有依赖
-          scripts/config --enable CONFIG_CGROUPS
-          scripts/config --enable CONFIG_CGROUP_FREEZER
-          scripts/config --enable CONFIG_CGROUP_PIDS
-          scripts/config --enable CONFIG_CGROUP_DEVICE
-          scripts/config --enable CONFIG_MEMCG
-          scripts/config --enable CONFIG_NAMESPACES
-          scripts/config --enable CONFIG_OVERLAY_FS
-          scripts/config --enable CONFIG_SECCOMP
-          scripts/config --enable CONFIG_BPF_SYSCALL
-          
-          # 启用模块支持
-          scripts/config --enable CONFIG_MODULES
-          scripts/config --enable CONFIG_MODULE_UNLOAD
+          # 加载你仓库原生的Hi3798MV100配置
+          make hi3798mv100_defconfig
           
           # 彻底禁用所有不需要的功能
-          scripts/config --disable CONFIG_DRM
+          scripts/config --disable CONFIG_HI_VDEC
+          scripts/config --disable CONFIG_HI_GPU
+          scripts/config --disable CONFIG_HI_HDMI
+          scripts/config --disable CONFIG_HI_MEDIA
           scripts/config --disable CONFIG_FB
+          scripts/config --disable CONFIG_DRM
           scripts/config --disable CONFIG_VIDEO
           scripts/config --disable CONFIG_SOUND
           scripts/config --disable CONFIG_INPUT_KEYBOARD
@@ -89,11 +67,28 @@ jobs:
           scripts/config --disable CONFIG_BLUETOOTH
           scripts/config --disable CONFIG_WIRELESS
           
-          # 内核优化
+          # 强制启用Docker所有必需依赖
+          scripts/config --enable CONFIG_CGROUPS
+          scripts/config --enable CONFIG_CGROUP_FREEZER
+          scripts/config --enable CONFIG_CGROUP_PIDS
+          scripts/config --enable CONFIG_CGROUP_DEVICE
+          scripts/config --enable CONFIG_CGROUP_CPUACCT
+          scripts/config --enable CONFIG_MEMCG
+          scripts/config --enable CONFIG_NAMESPACES
+          scripts/config --enable CONFIG_OVERLAY_FS
+          scripts/config --enable CONFIG_POSIX_MQUEUE
+          scripts/config --enable CONFIG_SECCOMP
+          scripts/config --enable CONFIG_CAPABILITIES
+          scripts/config --enable CONFIG_BPF_SYSCALL
+          scripts/config --enable CONFIG_NETFILTER
+          
+          # 启用模块支持和内核优化
+          scripts/config --enable CONFIG_MODULES
+          scripts/config --enable CONFIG_MODULE_UNLOAD
           scripts/config --disable CONFIG_DEBUG_INFO
           scripts/config --enable CONFIG_KERNEL_ZSTD
           
-          # 自动补全所有缺失的配置（非交互式）
+          # 自动补全所有6.x内核新增的配置项（无交互式）
           make olddefconfig
 
       - name: 编译6.6内核
@@ -104,21 +99,18 @@ jobs:
 
       - name: 生成刷机专用hi_kernel-mv100-32.bin
         run: |
-          # 使用你仓库中的原版mkimage工具
-          wget https://github.com/ASDHiope/HiSTBLinuxKernel/raw/linux-4.4.y/tools/mkimage
-          chmod +x mkimage
-          
-          # 海思固定加载地址0x40008000，不可修改
-          ./mkimage -A arm -O linux -T kernel -C none \
+          # 使用系统自带mkimage（功能与海思原版完全一致）
+          mkimage -A arm -O linux -T kernel -C none \
             -a 0x40008000 -e 0x40008000 \
             -n "Linux6.6-MV100-PureCLI" \
             -d arch/arm/boot/zImage hi_kernel-mv100-32.bin
           
+          echo "编译完成！内核文件信息："
           ls -lh hi_kernel-mv100-32.bin
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: hi_kernel-mv100-32-6.6-lts
+          name: hi_kernel-mv100-32-6.6-final
           path: hi_kernel-mv100-32.bin
           retention-days: 180
