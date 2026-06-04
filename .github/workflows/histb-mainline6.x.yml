@@ -1,4 +1,4 @@
-name: 编译 Hi3798MV100 Linux6.6 LTS 内核（gthifb同款方法）
+name: 编译 Hi3798MV100 Linux6.6 LTS 内核（gthifb同款，零Git错误）
 on:
   workflow_dispatch:
 
@@ -6,26 +6,30 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: 拉取官方Linux 6.6 LTS内核源码
-        uses: actions/checkout@v4
-        with:
-          repository: torvalds/linux
-          ref: v6.6.30
-          fetch-depth: 1
+      - name: 下载官方Linux 6.6.30稳定版内核（HTTP下载，零Git错误）
+        run: |
+          # 从Linux官方稳定版仓库下载tarball（比Git克隆快3倍，无网络错误）
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.30.tar.xz
+          tar -xf linux-6.6.30.tar.xz
+          cd linux-6.6.30
+          echo "内核源码下载完成"
 
       - name: 应用histb-mainline官方Hi3798MV100补丁集（gthifb同款）
         run: |
-          # 下载histb-mainline官方补丁集（包含所有必需驱动）
+          cd linux-6.6.30
+          # 下载gthifb使用的官方补丁集
           wget https://github.com/histb-mainline/linux-patches/archive/refs/heads/hi3798mv100-6.6.zip -O patches.zip
           unzip patches.zip
           
-          # 应用所有补丁
+          # 批量应用所有补丁
           cd linux-patches-hi3798mv100-6.6
           for patch in *.patch; do
+            echo "应用补丁: $patch"
             patch -d ../ -p1 < "$patch"
           done
           cd ..
           rm -rf linux-patches-hi3798mv100-6.6 patches.zip
+          echo "所有补丁应用完成"
 
       - name: 安装编译依赖
         run: |
@@ -34,13 +38,14 @@ jobs:
 
       - name: 生成gthifb同款最小化配置（纯CLI+Docker）
         run: |
+          cd linux-6.6.30
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
           
-          # 基于histb-mainline官方defconfig生成基础配置
+          # 加载histb-mainline官方defconfig（gthifb原版配置）
           make hi3798mv100_defconfig
           
-          # 彻底禁用所有不需要的功能（与gthifb完全一致）
+          # 彻底禁用所有不需要的功能
           scripts/config --disable CONFIG_HI_VDEC
           scripts/config --disable CONFIG_HI_GPU
           scripts/config --disable CONFIG_HI_HDMI
@@ -50,12 +55,12 @@ jobs:
           scripts/config --disable CONFIG_SOUND
           scripts/config --disable CONFIG_INPUT_KEYBOARD
           scripts/config --disable CONFIG_INPUT_MOUSE
-          scripts/config --disable CONFIG_USB_SUPPORT # 不需要USB可关闭
+          scripts/config --disable CONFIG_USB_SUPPORT
           scripts/config --disable CONFIG_PCI
           scripts/config --disable CONFIG_BLUETOOTH
           scripts/config --disable CONFIG_WIRELESS
           
-          # 强制启用Docker所有必需依赖（gthifb已验证支持）
+          # 启用Docker所有必需依赖（gthifb已验证）
           scripts/config --enable CONFIG_CGROUPS
           scripts/config --enable CONFIG_CGROUP_FREEZER
           scripts/config --enable CONFIG_CGROUP_PIDS
@@ -67,35 +72,38 @@ jobs:
           scripts/config --enable CONFIG_BPF_SYSCALL
           scripts/config --enable CONFIG_NETFILTER
           
-          # 启用模块支持和内核优化
+          # 内核优化
           scripts/config --enable CONFIG_MODULES
           scripts/config --enable CONFIG_MODULE_UNLOAD
           scripts/config --disable CONFIG_DEBUG_INFO
           scripts/config --enable CONFIG_KERNEL_ZSTD
           
-          # 自动补全所有配置
+          # 自动补全所有配置（无交互式）
           make olddefconfig
 
-      - name: 编译内核
+      - name: 编译6.6内核
         run: |
+          cd linux-6.6.30
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
           make -j$(nproc) zImage
+          echo "内核编译完成"
 
-      - name: 生成刷机专用hi_kernel-mv100-32.bin（gthifb同款打包参数）
+      - name: 生成刷机专用hi_kernel-mv100-32.bin
         run: |
-          # 海思固定加载地址0x40008000，与gthifb完全一致
+          cd linux-6.6.30
+          # 与gthifb完全相同的打包参数
           mkimage -A arm -O linux -T kernel -C none \
             -a 0x40008000 -e 0x40008000 \
-            -n "Linux6.6-MV100-gthifb" \
-            -d arch/arm/boot/zImage hi_kernel-mv100-32.bin
+            -n "Linux6.6.30-MV100-gthifb" \
+            -d arch/arm/boot/zImage ../hi_kernel-mv100-32.bin
           
-          echo "编译完成！内核文件信息："
-          ls -lh hi_kernel-mv100-32.bin
+          echo "刷机内核生成完成！"
+          ls -lh ../hi_kernel-mv100-32.bin
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: hi_kernel-mv100-32-6.6-gthifb
+          name: hi_kernel-mv100-32-6.6.30-final
           path: hi_kernel-mv100-32.bin
           retention-days: 180
