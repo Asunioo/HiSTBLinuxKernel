@@ -2,43 +2,69 @@ name: Build Hi3798MV100 Linux6.x Kernel bin
 on:
   push:
     branches: [ main, linux-6.x ]
-  workflow_dispatch: # 支持手动触发编译（推荐）
+  workflow_dispatch:
 
 jobs:
   build-kernel-6x:
-    runs-on: ubuntu-22.04 # 6.x内核编译依赖Ubuntu22.04+，24.04兼容性更好可自行替换
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
         with:
           repository: ASDHiope/HiSTBLinuxKernel
-          fetch-depth: 0 # 拉取完整历史用于分支切换
+          fetch-depth: 0
 
-      - name: Install 6.x内核专用交叉编译工具链 & 构建依赖
+      - name: Install build dependencies
         run: |
           sudo apt update -y
           sudo apt install -y build-essential gcc g++ make libncurses-dev bison flex libssl-dev libelf-dev bc git wget unzip lz4 zstd cpio kmod
-          # Linux6.x内核要求GCC 11+，使用Linaro 12.3 ARM32交叉编译器（海思MV100 ARMv7架构专用）
-          wget https://releases.linaro.org/components/toolchain/binaries/latest-12/arm-linux-gnueabihf/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf.tar.xz
-          tar -xf gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf.tar.xz -C /opt/
-          echo "/opt/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf/bin" >> $GITHUB_PATH
-          export CROSS_COMPILE=arm-linux-gnueabihf-
-          export ARCH=arm
 
-      - name: Switch to Linux6.x LTS分支（必须提前在你的仓库创建）
+      - name: Cache cross compile toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: /opt/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf
+          key: ${{ runner.os }}-gcc-linaro-12.3.0-armhf
+
+      - name: Download and install Linaro 12.3.0 toolchain (多源自动重试)
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          # 定义3个备用下载源
+          SOURCES=(
+            "https://releases.linaro.org/components/toolchain/binaries/12.3-2023.07/arm-linux-gnueabihf/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf.tar.xz"
+            "https://github.com/linaro-toolchain/binaries/releases/download/gcc-linaro-12.3.0-2023.07/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf.tar.xz"
+            "https://mirrors.tuna.tsinghua.edu.cn/linaro/releases/components/toolchain/binaries/12.3-2023.07/arm-linux-gnueabihf/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf.tar.xz"
+          )
+          
+          # 自动重试下载，最多尝试3次每个源
+          for i in "${!SOURCES[@]}"; do
+            echo "尝试下载源 $((i+1)): ${SOURCES[$i]}"
+            if wget --tries=3 --timeout=30 "${SOURCES[$i]}" -O gcc-linaro.tar.xz; then
+              echo "下载成功！"
+              tar -xf gcc-linaro.tar.xz -C /opt/
+              rm gcc-linaro.tar.xz
+              break
+            fi
+            echo "源 $((i+1)) 下载失败，尝试下一个..."
+          done
+          
+          # 检查是否下载成功
+          if [ ! -d "/opt/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf/bin" ]; then
+            echo "所有下载源均失败！"
+            exit 1
+          fi
+          
+          echo "/opt/gcc-linaro-12.3.0-2023.07-x86_64_arm-linux-gnueabihf/bin" >> $GITHUB_PATH
+
+      - name: Switch to Linux6.x LTS branch
         run: |
           git checkout linux-6.x
-          # 若未创建6.x分支，执行以下命令基于主线6.6 LTS初始化（推荐6.6，嵌入式最长支持到2028年）：
-          # git remote add linux-stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-          # git fetch linux-stable linux-6.6.y
-          # git checkout -b linux-6.x linux-stable/linux-6.6.y
-          # 然后合并你仓库4.4.y分支中的Hi3798MV100板级驱动patch
 
-      - name: 生成自定义defconfig（禁用所有多媒体，启用网卡+Docker全依赖）
+      - name: Generate custom defconfig
         run: |
-          # 1. 基于Hi3798MV100原始板级配置生成基础配置
           make hi3798mv100_defconfig
-          # 2. 彻底禁用VDEC/GPU/HDMI/显示相关所有模块（减小内核体积+避免冲突）
+          
+          # 禁用所有多媒体和显示相关模块
           scripts/config --disable CONFIG_HI_VDEC
           scripts/config --disable CONFIG_HI_GPU
           scripts/config --disable CONFIG_HI_HDMI
@@ -49,13 +75,15 @@ jobs:
           scripts/config --disable CONFIG_INPUT_KEYBOARD
           scripts/config --disable CONFIG_INPUT_MOUSE
           scripts/config --disable CONFIG_SOUND
-          # 3. 强制启用以太网及PHY驱动（纯CLI核心依赖）
+          
+          # 启用以太网和PHY驱动
           scripts/config --enable CONFIG_NET
           scripts/config --enable CONFIG_ETHERNET
           scripts/config --enable CONFIG_HI_ETH
           scripts/config --enable CONFIG_PHYLIB
-          scripts/config --enable CONFIG_REALTEK_PHY # 适配MV100常用RTL8201F PHY
-          # 4. Docker 25+ 6.x内核强制依赖配置（全部开启）
+          scripts/config --enable CONFIG_REALTEK_PHY
+          
+          # Docker 25+ 完整依赖
           scripts/config --enable CONFIG_CGROUPS
           scripts/config --enable CONFIG_CGROUP_FREEZER
           scripts/config --enable CONFIG_CGROUP_PIDS
@@ -69,38 +97,36 @@ jobs:
           scripts/config --enable CONFIG_CAPABILITIES
           scripts/config --enable CONFIG_BPF_SYSCALL
           scripts/config --enable CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
-          # 5. 开启模块编译与卸载（支持apt/opkg安装软件包）
+          
+          # 模块支持和内核优化
           scripts/config --enable CONFIG_MODULES
           scripts/config --enable CONFIG_MODULE_UNLOAD
           scripts/config --enable CONFIG_MODVERSIONS
-          # 6. 6.x内核专用优化：关闭调试信息，开启压缩
           scripts/config --disable CONFIG_DEBUG_INFO
           scripts/config --enable CONFIG_KERNEL_ZSTD
-          # 保存最终配置用于后续复用
+          
           make savedefconfig
           cp defconfig arch/arm/configs/hi3798mv100_nodisp_docker_6x_defconfig
 
-      - name: 编译Linux6.x内核并生成刷机专用bin
+      - name: Compile kernel and generate hi_kernel-mv100-32.bin
         run: |
           export CROSS_COMPILE=arm-linux-gnueabihf-
           export ARCH=arm
-          # 并行编译（利用GitHub Actions 2核CPU）
           make -j2 zImage
-          # 海思专用mkimage工具打包为刷机标准格式hi_kernel-mv100-32.bin
-          # 加载地址0x40008000和入口地址为Hi3798MV100固定值，不可修改
-          [ ! -f mkimage ] && wget https://github.com/ASDHiope/HiSTBLinuxKernel/raw/linux-4.4.y/tools/mkimage && chmod +x mkimage
+          
+          # 使用你仓库中的mkimage工具
+          [ ! -f mkimage ] && wget --tries=3 https://github.com/ASDHiope/HiSTBLinuxKernel/raw/linux-4.4.y/tools/mkimage && chmod +x mkimage
           ./mkimage -A arm -O linux -T kernel -C none -a 0x40008000 -e 0x40008000 -n "Linux6.6-MV100-CLI" -d arch/arm/boot/zImage hi_kernel-mv100-32.bin
-          # 验证生成文件大小（正常6.x纯CLI内核约2.5-3.5MB）
           ls -lh hi_kernel-mv100-32.bin
 
-      - name: 上传编译产物到Actions Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: hi_kernel-mv100-32-6x-bin
           path: hi_kernel-mv100-32.bin
-          retention-days: 90 # 保留90天
+          retention-days: 90
 
-      - name: 自动发布到GitHub Release（可选）
+      - name: Auto release
         if: github.ref == 'refs/heads/linux-6.x'
         uses: softprops/action-gh-release@v2
         with:
