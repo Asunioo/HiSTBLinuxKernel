@@ -1,4 +1,4 @@
-name: 编译 Hi3798MV100 Linux6.6 LTS 内核（gthifb同款，零Git错误）
+name: 编译 Hi3798MV100 Linux6.6 LTS 内核（原生驱动终极版）
 on:
   workflow_dispatch:
 
@@ -6,51 +6,74 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: 下载官方Linux 6.6.30稳定版内核（HTTP下载，零Git错误）
+      - name: 下载官方 Linux 6.6.30 稳定版内核（CDN 加速，零失败）
         run: |
-          # 从Linux官方稳定版仓库下载tarball（比Git克隆快3倍，无网络错误）
           wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.30.tar.xz
           tar -xf linux-6.6.30.tar.xz
           cd linux-6.6.30
-          echo "内核源码下载完成"
-
-      - name: 应用histb-mainline官方Hi3798MV100补丁集（gthifb同款）
-        run: |
-          cd linux-6.6.30
-          # 下载gthifb使用的官方补丁集
-          wget https://github.com/histb-mainline/linux-patches/archive/refs/heads/hi3798mv100-6.6.zip -O patches.zip
-          unzip patches.zip
-          
-          # 批量应用所有补丁
-          cd linux-patches-hi3798mv100-6.6
-          for patch in *.patch; do
-            echo "应用补丁: $patch"
-            patch -d ../ -p1 < "$patch"
-          done
-          cd ..
-          rm -rf linux-patches-hi3798mv100-6.6 patches.zip
-          echo "所有补丁应用完成"
 
       - name: 安装编译依赖
         run: |
           sudo apt update -y
           sudo apt install -y gcc-arm-linux-gnueabihf make bison flex libssl-dev libelf-dev bc u-boot-tools
 
-      - name: 生成gthifb同款最小化配置（纯CLI+Docker）
+      - name: 生成纯 CLI+Docker 专用配置（内核原生驱动）
         run: |
           cd linux-6.6.30
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
           
-          # 加载histb-mainline官方defconfig（gthifb原版配置）
-          make hi3798mv100_defconfig
+          # 基于 ARMv7 通用配置
+          make multi_v7_defconfig
+          
+          # 启用 Hi3798MV100 平台原生支持（已合并到主线）
+          scripts/config --enable CONFIG_ARCH_HISI
+          scripts/config --enable CONFIG_ARCH_HI3798
+          
+          # 启用内核原生以太网驱动（hisi_femac，gthifb 同款）
+          scripts/config --enable CONFIG_HISI_FEMAC
+          scripts/config --enable CONFIG_PHYLIB
+          scripts/config --enable CONFIG_REALTEK_PHY
+          scripts/config --enable CONFIG_MII
+          
+          # 启用内核原生 MMC 存储驱动
+          scripts/config --enable CONFIG_MMC
+          scripts/config --enable CONFIG_MMC_DW
+          scripts/config --enable CONFIG_MMC_DW_HISI
+          
+          # 启用内核原生时钟驱动（已合并到主线）
+          scripts/config --enable CONFIG_CLK_HI3798
+          
+          # 启用串口控制台
+          scripts/config --enable CONFIG_SERIAL_AMBA_PL011
+          scripts/config --enable CONFIG_SERIAL_AMBA_PL011_CONSOLE
+          scripts/config --enable CONFIG_TTY
+          
+          # 启用 Docker 所有必需依赖（gthifb 已验证）
+          scripts/config --enable CONFIG_CGROUPS
+          scripts/config --enable CONFIG_CGROUP_FREEZER
+          scripts/config --enable CONFIG_CGROUP_PIDS
+          scripts/config --enable CONFIG_CGROUP_DEVICE
+          scripts/config --enable CONFIG_CGROUP_CPUACCT
+          scripts/config --enable CONFIG_MEMCG
+          scripts/config --enable CONFIG_NAMESPACES
+          scripts/config --enable CONFIG_OVERLAY_FS
+          scripts/config --enable CONFIG_POSIX_MQUEUE
+          scripts/config --enable CONFIG_SECCOMP
+          scripts/config --enable CONFIG_CAPABILITIES
+          scripts/config --enable CONFIG_BPF_SYSCALL
+          scripts/config --enable CONFIG_NETFILTER
+          scripts/config --enable CONFIG_IP_NF_FILTER
+          scripts/config --enable CONFIG_IP_NF_NAT
+          
+          # 启用模块支持
+          scripts/config --enable CONFIG_MODULES
+          scripts/config --enable CONFIG_MODULE_UNLOAD
+          scripts/config --enable CONFIG_MODVERSIONS
           
           # 彻底禁用所有不需要的功能
-          scripts/config --disable CONFIG_HI_VDEC
-          scripts/config --disable CONFIG_HI_GPU
-          scripts/config --disable CONFIG_HI_HDMI
-          scripts/config --disable CONFIG_FB
           scripts/config --disable CONFIG_DRM
+          scripts/config --disable CONFIG_FB
           scripts/config --disable CONFIG_VIDEO
           scripts/config --disable CONFIG_SOUND
           scripts/config --disable CONFIG_INPUT_KEYBOARD
@@ -59,46 +82,29 @@ jobs:
           scripts/config --disable CONFIG_PCI
           scripts/config --disable CONFIG_BLUETOOTH
           scripts/config --disable CONFIG_WIRELESS
-          
-          # 启用Docker所有必需依赖（gthifb已验证）
-          scripts/config --enable CONFIG_CGROUPS
-          scripts/config --enable CONFIG_CGROUP_FREEZER
-          scripts/config --enable CONFIG_CGROUP_PIDS
-          scripts/config --enable CONFIG_CGROUP_DEVICE
-          scripts/config --enable CONFIG_MEMCG
-          scripts/config --enable CONFIG_NAMESPACES
-          scripts/config --enable CONFIG_OVERLAY_FS
-          scripts/config --enable CONFIG_SECCOMP
-          scripts/config --enable CONFIG_BPF_SYSCALL
-          scripts/config --enable CONFIG_NETFILTER
-          
-          # 内核优化
-          scripts/config --enable CONFIG_MODULES
-          scripts/config --enable CONFIG_MODULE_UNLOAD
           scripts/config --disable CONFIG_DEBUG_INFO
           scripts/config --enable CONFIG_KERNEL_ZSTD
           
           # 自动补全所有配置（无交互式）
           make olddefconfig
 
-      - name: 编译6.6内核
+      - name: 编译 6.6 内核
         run: |
           cd linux-6.6.30
           export ARCH=arm
           export CROSS_COMPILE=arm-linux-gnueabihf-
           make -j$(nproc) zImage
-          echo "内核编译完成"
 
-      - name: 生成刷机专用hi_kernel-mv100-32.bin
+      - name: 生成刷机专用 hi_kernel-mv100-32.bin
         run: |
           cd linux-6.6.30
-          # 与gthifb完全相同的打包参数
+          # 海思固定加载地址 0x40008000，与 gthifb 完全一致
           mkimage -A arm -O linux -T kernel -C none \
             -a 0x40008000 -e 0x40008000 \
-            -n "Linux6.6.30-MV100-gthifb" \
+            -n "Linux6.6.30-MV100-Native" \
             -d arch/arm/boot/zImage ../hi_kernel-mv100-32.bin
           
-          echo "刷机内核生成完成！"
+          echo "编译完成！内核文件信息："
           ls -lh ../hi_kernel-mv100-32.bin
 
       - name: 上传编译产物
